@@ -1,0 +1,94 @@
+name: Capture APK Resource Samples
+
+on:
+  push:
+    paths:
+      - '.github/workflows/capture-resource-samples.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/out
+          curl -L --fail --retry 3 -o work/game.apk \
+            'https://github.com/iinmissing/game/releases/download/prototype-apk/wudonglunhuijue.apk'
+          echo '66c2928ecab32835feb8c42fd9b21aa641e240c826136b433b2cb3e8f103ab40  work/game.apk' | sha256sum -c -
+
+      - name: Extract representative files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/out
+          unzip -j ../game.apk \
+            assets/animate/warrior/1001.png \
+            assets/animate/warriorQ/1001.png \
+            assets/animate/unit/1001.png \
+            assets/animate/skill/111001.png \
+            assets/icons/scene/1_bgfront.png \
+            assets/icons/scene/1_bgback.png \
+            assets/platform/config.lua \
+            lib/x86/libgame.so \
+            lib/armeabi/libgame.so || true
+          cd ../..
+
+          # Extract several hashed Lua files while preserving unique names.
+          mkdir -p work/lua_samples
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          z=zipfile.ZipFile('work/game.apk')
+          names=[n for n in z.namelist() if n.startswith('assets/bin/') and n.endswith('.lua')][:12]
+          out=Path('work/lua_samples')
+          for i,n in enumerate(names):
+              data=z.read(n)
+              p=out/f'{i:02d}_{Path(n).name}'
+              p.write_bytes(data)
+          (out/'INDEX.txt').write_text('\n'.join(names)+'\n',encoding='utf-8')
+          PY
+
+      - name: Record byte-level diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/diagnostics
+          for f in work/out/* work/lua_samples/*.lua; do
+            [ -f "$f" ] || continue
+            b="$(basename "$f")"
+            {
+              echo "===== $f ====="
+              stat -c 'size=%s' "$f"
+              file "$f"
+              echo '-- first 256 bytes --'
+              xxd -g1 -l256 "$f"
+              echo '-- strings --'
+              strings -a "$f" | head -n 80 || true
+              echo
+            } > "work/diagnostics/${b}.txt"
+          done
+
+          # Native library clues for custom image/Lua loaders and crypto.
+          for so in work/out/libgame.so; do
+            [ -f "$so" ] || continue
+            strings -a "$so" \
+              | grep -Eai 'png|image|texture|decrypt|encrypt|xxtea|xor|aes|lua|luac|loadbuffer|decode|decoder|fileutils|assets/bin|warriorQ|warrior' \
+              | head -n 5000 > work/diagnostics/libgame_keywords.txt || true
+          done
+
+      - name: Upload samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-decoder-samples
+          path: work/
+          retention-days: 7
+          if-no-files-found: error
