@@ -1,0 +1,233 @@
+name: APK Reconnaissance
+
+on:
+  push:
+    paths:
+      - '.github/workflows/analyze-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work report
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -o work/wudonglunhuijue.apk \
+            'https://github.com/iinmissing/game/releases/download/prototype-apk/wudonglunhuijue.apk'
+          echo '66c2928ecab32835feb8c42fd9b21aa641e240c826136b433b2cb3e8f103ab40  work/wudonglunhuijue.apk' | sha256sum -c -
+          ls -lh work/wudonglunhuijue.apk | tee report/apk_size.txt
+          file work/wudonglunhuijue.apk | tee report/apk_file_type.txt
+          sha256sum work/wudonglunhuijue.apk | tee report/apk_sha256.txt
+
+      - name: Unpack APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/extracted
+          unzip -q work/wudonglunhuijue.apk -d work/extracted
+          unzip -l work/wudonglunhuijue.apk > report/unzip_listing.txt
+          du -sh work/extracted | tee report/extracted_size.txt
+
+      - name: Collect manifest and package metadata
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "ANDROID_HOME=${ANDROID_HOME:-}"
+            echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+            command -v aapt || true
+            command -v aapt2 || true
+            command -v apkanalyzer || true
+          } > report/android_tools.txt
+
+          AAPT_BIN=""
+          if command -v aapt >/dev/null 2>&1; then
+            AAPT_BIN="$(command -v aapt)"
+          elif [ -n "${ANDROID_HOME:-}" ]; then
+            AAPT_BIN="$(find "$ANDROID_HOME/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -n "$AAPT_BIN" ] && [ -x "$AAPT_BIN" ]; then
+            "$AAPT_BIN" dump badging work/wudonglunhuijue.apk > report/aapt_badging.txt 2>&1 || true
+            "$AAPT_BIN" dump xmltree work/wudonglunhuijue.apk AndroidManifest.xml > report/manifest_xmltree.txt 2>&1 || true
+          else
+            echo "aapt not found" > report/aapt_badging.txt
+          fi
+
+      - name: Build file and resource index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          import os, re, subprocess
+
+          root = Path('work/extracted')
+          report = Path('report')
+          report.mkdir(exist_ok=True)
+
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          rels = [p.relative_to(root).as_posix() for p in files]
+
+          (report / 'all_files.txt').write_text('\n'.join(rels) + '\n', encoding='utf-8')
+
+          top = Counter()
+          ext = Counter()
+          for p, rel in zip(files, rels):
+              top[rel.split('/', 1)[0]] += 1
+              suffix = p.suffix.lower() or '<no_ext>'
+              ext[suffix] += 1
+
+          with (report / 'top_level_counts.txt').open('w', encoding='utf-8') as f:
+              for k, v in top.most_common():
+                  f.write(f'{v:8d}  {k}\n')
+
+          with (report / 'extension_counts.txt').open('w', encoding='utf-8') as f:
+              for k, v in ext.most_common():
+                  f.write(f'{v:8d}  {k}\n')
+
+          largest = sorted(files, key=lambda p: p.stat().st_size, reverse=True)[:300]
+          with (report / 'largest_files.txt').open('w', encoding='utf-8') as f:
+              for p in largest:
+                  f.write(f'{p.stat().st_size:12d}  {p.relative_to(root).as_posix()}\n')
+
+          keywords = [
+              'portrait','avatar','head','hero','role','character','warrior',
+              'battle','fight','attack','skill','effect','hit','death','die',
+              'spine','dragon','atlas','anim','animation','buff','heal','crit',
+              'background','scene','cocos','creator','lua','xxtea'
+          ]
+          with (report / 'keyword_paths.txt').open('w', encoding='utf-8') as f:
+              lower_rels = [(r.lower(), r) for r in rels]
+              for kw in keywords:
+                  hits = [orig for low, orig in lower_rels if kw in low]
+                  f.write(f'===== {kw} ({len(hits)}) =====\n')
+                  for hit in hits[:1000]:
+                      f.write(hit + '\n')
+                  if len(hits) > 1000:
+                      f.write(f'... truncated {len(hits)-1000} more\n')
+                  f.write('\n')
+
+          interesting_exts = {
+              '.png','.jpg','.jpeg','.webp','.pvr','.pkm','.astc','.ktx','.dds',
+              '.plist','.atlas','.skel','.json','.xml','.lua','.luac','.bin','.dat',
+              '.fnt','.ttf','.otf','.mp3','.ogg','.wav','.mp4','.zip'
+          }
+          with (report / 'interesting_resources.txt').open('w', encoding='utf-8') as f:
+              for p in files:
+                  if p.suffix.lower() in interesting_exts:
+                      f.write(p.relative_to(root).as_posix() + '\n')
+
+          # A representative `file(1)` sample from assets/res and all native libraries.
+          sample = []
+          for p in files:
+              rel = p.relative_to(root).as_posix()
+              if rel.startswith(('assets/', 'res/')) and len(sample) < 800:
+                  sample.append(p)
+              if rel.startswith('lib/') and p.suffix == '.so':
+                  sample.append(p)
+          with (report / 'file_type_samples.txt').open('w', encoding='utf-8', errors='replace') as f:
+              for p in sample:
+                  try:
+                      out = subprocess.check_output(['file', '-b', str(p)], text=True, errors='replace').strip()
+                  except Exception as e:
+                      out = f'ERROR: {e}'
+                  f.write(f'{p.relative_to(root).as_posix()}\t{out}\n')
+
+          # First bytes of likely opaque resource containers for encryption/packing clues.
+          opaque_exts = {'.bin','.dat','.pak','.pack','.res','.assets','.bundle','.obb'}
+          opaque = [p for p in files if p.suffix.lower() in opaque_exts or (not p.suffix and p.stat().st_size > 4096)]
+          with (report / 'opaque_headers.txt').open('w', encoding='utf-8') as f:
+              for p in opaque[:500]:
+                  try:
+                      head = p.read_bytes()[:32].hex(' ')
+                  except Exception as e:
+                      head = f'ERROR {e}'
+                  f.write(f'{p.relative_to(root).as_posix()}\t{p.stat().st_size}\t{head}\n')
+
+          print(f'indexed {len(files)} files')
+          PY
+
+      - name: Inspect native libraries and engine clues
+        shell: bash
+        run: |
+          set -uo pipefail
+          find work/extracted/lib -type f -name '*.so' -print 2>/dev/null | sort > report/native_libraries.txt || true
+          : > report/native_library_types.txt
+          while IFS= read -r so; do
+            [ -f "$so" ] || continue
+            file "$so" >> report/native_library_types.txt 2>&1 || true
+          done < report/native_libraries.txt
+
+          : > report/engine_string_clues.txt
+          while IFS= read -r so; do
+            [ -f "$so" ] || continue
+            echo "===== ${so#work/extracted/} =====" >> report/engine_string_clues.txt
+            strings -a "$so" 2>/dev/null \
+              | grep -Eai 'cocos2d|cocos creator|quick%-cocos|lua|luajit|xxtea|spine|dragonbones|unity|il2cpp|libunity|unreal|ue4|fairygui' \
+              | head -n 300 >> report/engine_string_clues.txt || true
+            echo >> report/engine_string_clues.txt
+          done < report/native_libraries.txt
+
+          find work/extracted -type f \( \
+            -iname '*.lua' -o -iname '*.luac' -o -iname '*.plist' -o -iname '*.atlas' -o \
+            -iname '*.skel' -o -iname '*.pvr' -o -iname '*.pkm' -o -iname '*.astc' -o \
+            -iname '*.bundle' -o -iname '*.assets' -o -iname '*.pak' \
+          \) -print | sed 's#^work/extracted/##' | sort > report/engine_resource_files.txt || true
+
+      - name: Summarize reconnaissance
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# APK Reconnaissance Summary'
+            echo
+            echo '## APK'
+            cat report/apk_size.txt
+            cat report/apk_file_type.txt
+            cat report/apk_sha256.txt
+            echo
+            echo '## Extracted size'
+            cat report/extracted_size.txt
+            echo
+            echo '## Top-level file counts'
+            head -n 50 report/top_level_counts.txt
+            echo
+            echo '## Most common extensions'
+            head -n 80 report/extension_counts.txt
+            echo
+            echo '## Native libraries'
+            cat report/native_libraries.txt || true
+            echo
+            echo '## Android package metadata'
+            head -n 120 report/aapt_badging.txt || true
+            echo
+            echo '## Engine string clues'
+            head -n 400 report/engine_string_clues.txt || true
+            echo
+            echo '## Resource-format clues'
+            head -n 300 report/engine_resource_files.txt || true
+          } > report/SUMMARY.md
+
+          cat report/SUMMARY.md
+
+      - name: Upload reconnaissance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-recon
+          path: report/
+          retention-days: 7
+          if-no-files-found: error
